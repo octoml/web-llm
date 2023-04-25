@@ -20,16 +20,13 @@ def _parse_args():
     args = argparse.ArgumentParser()
     args.add_argument("--device-name", type=str, default="auto")
     args.add_argument("--debug-dump", action="store_true", default=False)
-    args.add_argument("--dtype", type=str, default="float16")
     args.add_argument("--artifact-path", type=str, default="dist")
     args.add_argument("--prompt", type=str, default="The capital of Canada is")
     args.add_argument("--model", type=str, default="vicuna-7b-v1")
     args.add_argument("--profile", action="store_true", default=False)
     parsed = args.parse_args()
     parsed.model_path = os.path.join(parsed.artifact_path, "models", parsed.model)
-    parsed.artifact_path = os.path.join(
-        parsed.artifact_path, parsed.model, parsed.dtype
-    )
+    parsed.artifact_path = os.path.join(parsed.artifact_path, parsed.model)
     if parsed.device_name == "auto":
         if tvm.cuda().exist:
             parsed.device_name = "cuda"
@@ -59,6 +56,19 @@ class LibCompare(LibCompareVMInstrument):
             print(f"Time-eval result {name} on {self.device}: {res}")
 
 
+def create_kv_caches(device):
+    kv_caches = []
+    fcreate_cache = tvm.get_global_func("vm.builtin.attention_kv_cache_create")
+    for i in range(64):
+        kv_cache = fcreate_cache(
+            tvm.nd.empty((1, 32, 128), device=device, dtype="float32"),
+            tvm.runtime.ShapeTuple([6, 32, 128]),
+            0,
+        )
+        kv_caches.append(kv_cache)
+    return kv_caches
+
+
 def deploy_to_pipeline(args) -> None:
     device = tvm.device(args.device_name)
     const_params = utils.load_params(args.artifact_path, device)
@@ -77,8 +87,7 @@ def deploy_to_pipeline(args) -> None:
     first_sampled_token = tvm.nd.array(np.array([[6234]]).astype("int32"), device)
     seq_len_shape = tvm.runtime.ShapeTuple([inputs.shape[1]])
     second_seq_len_shape = tvm.runtime.ShapeTuple([inputs.shape[1] + 1])
-
-    kv_caches = vm["create_kv_cache"]()
+    kv_caches = create_kv_caches(device)
     print("Running inference...")
     start = time.time()
     logits, kv_caches = vm["encoding"](inputs, seq_len_shape, kv_caches, const_params)
@@ -105,16 +114,12 @@ def deploy_to_pipeline(args) -> None:
         vm.set_instrument(cmp_instrument)
 
         print("Profiling...")
-        profile_file_path = os.path.join(
-            args.artifact_path, "debug", "evaluate_profile.log"
-        )
+        profile_file_path = os.path.join(args.artifact_path, "debug", "evaluate_profile.log")
         with open(profile_file_path, "w") as file:
             with redirect_stdout(file):
                 kv_caches = create_kv_caches(device)
                 print("======================= Starts Encoding =======================")
-                logits, kv_caches = vm["encoding"](
-                    inputs, seq_len_shape, kv_caches, const_params
-                )
+                logits, kv_caches = vm["encoding"](inputs, seq_len_shape, kv_caches, const_params)
                 print("======================= Starts Decoding =======================")
                 logits, kv_caches = vm["decoding"](
                     first_sampled_token, second_seq_len_shape, kv_caches, const_params

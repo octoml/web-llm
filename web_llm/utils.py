@@ -5,13 +5,12 @@ import tvm.testing
 from tvm import meta_schedule as ms
 
 
-def get_config(hf_config, model, dtype):
+def get_config(hf_config, model):
     if "vicuna" in model or "llama" in model:
         from .relax_model.llama import LlamaConfig as RelaxConfig
 
         return RelaxConfig(
-            # max_sequence_length=hf_config.max_sequence_length,
-            dtype=dtype,
+            #max_sequence_length=hf_config.max_sequence_length,
             vocab_size=hf_config.vocab_size,
             hidden_size=hf_config.hidden_size,
             intermediate_size=hf_config.intermediate_size,
@@ -28,7 +27,7 @@ def get_config(hf_config, model, dtype):
         )
     else:
         raise ValueError(f"Model {model} not supported")
-
+    
 
 def split_transform_deploy_mod(
     mod: tvm.IRModule, model_names: List[str]
