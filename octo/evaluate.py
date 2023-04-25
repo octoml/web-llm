@@ -20,7 +20,9 @@ def _parse_args():
     args = argparse.ArgumentParser()
     args.add_argument("--device-name", type=str, default="auto")
     args.add_argument("--debug-dump", action="store_true", default=False)
-    args.add_argument("--dtype", type=str, default="float16")
+    args.add_argument(
+        "--dtype", type=str, choices=["float32", "float16", "int4"], default="float16"
+    )
     args.add_argument("--artifact-path", type=str, default="dist")
     args.add_argument("--prompt", type=str, default="The capital of Canada is")
     args.add_argument("--model", type=str, default="vicuna-7b-v1")
@@ -63,7 +65,9 @@ def deploy_to_pipeline(args) -> None:
     device = tvm.device(args.device_name)
     const_params = utils.load_params(args.artifact_path, device)
     ex = tvm.runtime.load_module(
-        os.path.join(args.artifact_path, f"{args.model}_{args.device_name}.so")
+        os.path.join(
+            args.artifact_path, f"{args.model}_{args.device_name}_{args.dtype}.so"
+        )
     )
     vm = relax.VirtualMachine(ex, device)
 
@@ -79,7 +83,7 @@ def deploy_to_pipeline(args) -> None:
     second_seq_len_shape = tvm.runtime.ShapeTuple([inputs.shape[1] + 1])
 
     kv_caches = vm["create_kv_cache"]()
-    print("Running inference...")
+    print(f"Running inference: {inputs.shape[1]} tokens")
     start = time.time()
     logits, kv_caches = vm["encoding"](inputs, seq_len_shape, kv_caches, const_params)
     device.sync()
@@ -110,7 +114,7 @@ def deploy_to_pipeline(args) -> None:
         )
         with open(profile_file_path, "w") as file:
             with redirect_stdout(file):
-                kv_caches = create_kv_caches(device)
+                kv_caches = vm["create_kv_cache"]()
                 print("======================= Starts Encoding =======================")
                 logits, kv_caches = vm["encoding"](
                     inputs, seq_len_shape, kv_caches, const_params
