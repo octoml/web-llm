@@ -12,6 +12,7 @@ from tvm.script import relax as R
 class LlamaConfig:
     def __init__(
         self,
+        dtype,
         max_sequence_length=2048,
         vocab_size=32000,
         hidden_size=4096,
@@ -29,6 +30,7 @@ class LlamaConfig:
         position_embedding_base=10000,
         **kwargs,
     ):
+        self.dtype = dtype
         self.max_sequence_length = max_sequence_length
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
@@ -48,12 +50,14 @@ class LlamaConfig:
 
 
 class Linear(nn.Module):
-    def __init__(self, in_features, out_features, bias=True):
+    def __init__(self, in_features, out_features, dtype, bias=True):
         self.in_features = in_features
         self.out_features = out_features
-        self.weight = nn.Parameter((out_features, in_features), name="linear_weight")
+        self.weight = nn.Parameter(
+            (out_features, in_features), dtype=dtype, name="linear_weight"
+        )
         if bias:
-            self.bias = nn.Parameter((out_features,), name="linear_bias")
+            self.bias = nn.Parameter((out_features,), dtype=dtype, name="linear_bias")
         else:
             self.bias = None
 
@@ -62,10 +66,12 @@ class Linear(nn.Module):
 
 
 class Embedding(nn.Module):
-    def __init__(self, num_embeddings, embedding_dim):
+    def __init__(self, num_embeddings, embedding_dim, dtype):
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
-        self.weight = nn.Parameter((num_embeddings, embedding_dim), name="embedding_weight")
+        self.weight = nn.Parameter(
+            (num_embeddings, embedding_dim), dtype=dtype, name="embedding_weight"
+        )
 
     def forward(self, x: relax.Expr) -> relax.Var:
         from tvm.relax.op import reshape, take
@@ -82,9 +88,9 @@ class Embedding(nn.Module):
 
 
 class LlamaRMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps=1e-6):
-        self.weight = nn.Parameter((hidden_size,), name="rms_norm_weight")
-        self.variance_epsilon = eps
+    def __init__(self, hidden_size, dtype, eps=1e-6):
+        self.weight = nn.Parameter((hidden_size,), dtype=dtype, name="rms_norm_weight")
+        self.variance_epsilon = tvm.tir.const(eps, dtype)
 
     def forward(self, hidden_states):
         from tvm import te, tir
@@ -93,7 +99,11 @@ class LlamaRMSNorm(nn.Module):
             is_float32 = x.dtype == "float32"
 
             def f_square(x):
-                return tir.Cast(x, "float32") * tir.Cast(x, "float32") if not is_float32 else x * x
+                return (
+                    tir.Cast("float32", x) * tir.Cast("float32", x)
+                    if not is_float32
+                    else x * x
+                )
 
             k = te.reduce_axis((0, x.shape[2]), name="k")
             square_sum = te.compute(
@@ -106,26 +116,32 @@ class LlamaRMSNorm(nn.Module):
                 x_val = x[bsz, i, k]
                 if not is_float32:
                     x_val = tir.Cast("float32", x_val)
-                return x_val / tir.sqrt(square_sum[bsz, i] / x.shape[2] + self.variance_epsilon)
+                return x_val / tir.sqrt(
+                    square_sum[bsz, i] / x.shape[2] + self.variance_epsilon
+                )
+
+            def f_mul_cast(x, y):
+                value = x * y
+                if not is_float32:
+                    value = tir.Cast(x.dtype, value)
+                return value
 
             return te.compute(
                 x.shape,
-                lambda bsz, i, k: weight(k) * f_div_cast(bsz, i, k),
+                lambda bsz, i, k: f_mul_cast(weight(k), f_div_cast(bsz, i, k)),
                 name="rms_norm",
             )
 
-        return nn.emit_te(f_rms_norm, hidden_states, self.weight, primfunc_name_hint="rms_norm")
+        return nn.emit_te(
+            f_rms_norm, hidden_states, self.weight, primfunc_name_hint="rms_norm"
+        )
 
 
 class LlamaMLP(nn.Module):
-    def __init__(
-        self,
-        hidden_size: int,
-        intermediate_size: int,
-    ):
-        self.gate_proj = Linear(hidden_size, intermediate_size, bias=False)
-        self.down_proj = Linear(intermediate_size, hidden_size, bias=False)
-        self.up_proj = Linear(hidden_size, intermediate_size, bias=False)
+    def __init__(self, hidden_size: int, intermediate_size: int, dtype: str):
+        self.gate_proj = Linear(hidden_size, intermediate_size, dtype=dtype, bias=False)
+        self.down_proj = Linear(intermediate_size, hidden_size, dtype=dtype, bias=False)
+        self.up_proj = Linear(hidden_size, intermediate_size, dtype=dtype, bias=False)
 
     def forward(self, x):
         return self.down_proj(relax.op.nn.silu(self.gate_proj(x)) * self.up_proj(x))
@@ -137,7 +153,9 @@ def apply_rotary_pos_emb(q, k, cos, sin, offset: int = 0):
 
         def rotary_compute(*idx):
             i, j = idx[-3], idx[-1]
-            return cos[offset + i, j] * tensor(*idx) + sin[offset + i, j] * tvm.tir.Select(
+            return cos[offset + i, j] * tensor(*idx) + sin[
+                offset + i, j
+            ] * tvm.tir.Select(
                 j >= n_feat_half,
                 tensor[idx[0], i, idx[2], j - n_feat_half],
                 -tensor[idx[0], i, idx[2], j + n_feat_half],
@@ -157,7 +175,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, offset: int = 0):
 class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, hidden_size: int, num_heads: int):
+    def __init__(self, hidden_size: int, num_heads: int, dtype: str):
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.head_dim = self.hidden_size // self.num_heads
@@ -167,10 +185,19 @@ class LlamaAttention(nn.Module):
                 f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
                 f" and `num_heads`: {self.num_heads})."
             )
-        self.q_proj = Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.k_proj = Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.v_proj = Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.o_proj = Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+
+        self.q_proj = Linear(
+            self.hidden_size, self.num_heads * self.head_dim, dtype=dtype, bias=False
+        )
+        self.k_proj = Linear(
+            self.hidden_size, self.num_heads * self.head_dim, dtype=dtype, bias=False
+        )
+        self.v_proj = Linear(
+            self.hidden_size, self.num_heads * self.head_dim, dtype=dtype, bias=False
+        )
+        self.o_proj = Linear(
+            self.num_heads * self.head_dim, self.hidden_size, dtype=dtype, bias=False
+        )
 
     def forward(
         self,
@@ -319,13 +346,23 @@ class LlamaDecoderLayer(nn.Module):
         self.self_attn = LlamaAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
+            dtype=config.dtype,
         )
         self.mlp = LlamaMLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
+            dtype=config.dtype,
         )
-        self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = LlamaRMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=config.dtype,
+        )
+        self.post_attention_layernorm = LlamaRMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=config.dtype,
+        )
 
     def forward(
         self,
@@ -369,8 +406,16 @@ def _make_causal_mask(input_ids_shape, dtype, src_len):
     diag_mask = nn.emit(broadcast_to(mask, (bsz, 1, tgt_len, tgt_len)))
     if src_len == tgt_len:
         return diag_mask
+
     def extend_te(x, tgt_len, src_len):
-        return te.compute((bsz, 1, tgt_len, src_len), lambda b, _, i, j: te.if_then_else(j < src_len - tgt_len, 0, x[b, _, i, j - (src_len-tgt_len)]), name="concat_te")
+        return te.compute(
+            (bsz, 1, tgt_len, src_len),
+            lambda b, _, i, j: te.if_then_else(
+                j < src_len - tgt_len, 0, x[b, _, i, j - (src_len - tgt_len)]
+            ),
+            name="concat_te",
+        )
+
     return nn.emit_te(extend_te, diag_mask, tgt_len, src_len)
 
 
@@ -379,9 +424,15 @@ class LlamaModel(nn.Module):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = Embedding(config.vocab_size, config.hidden_size)
-        self.layers = [LlamaDecoderLayer(config) for _ in range(config.num_hidden_layers)]
-        self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.embed_tokens = Embedding(
+            config.vocab_size, config.hidden_size, dtype=config.dtype
+        )
+        self.layers = [
+            LlamaDecoderLayer(config) for _ in range(config.num_hidden_layers)
+        ]
+        self.norm = LlamaRMSNorm(
+            config.hidden_size, dtype=config.dtype, eps=config.rms_norm_eps
+        )
 
     def _prepare_decoder_attention_mask(self, input_shape, src_len, dtype):
         # create causal mask
@@ -393,7 +444,9 @@ class LlamaModel(nn.Module):
             # Get src_len from input parameters
             # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
             bsz, tgt_len = input_shape
-            combined_attention_mask = nn.emit(relax.op.zeros((bsz, 1, tgt_len, src_len), dtype))
+            combined_attention_mask = nn.emit(
+                relax.op.zeros((bsz, 1, tgt_len, src_len), dtype)
+            )
         return combined_attention_mask
 
     def forward(
@@ -443,13 +496,23 @@ class LlamaModel(nn.Module):
 class LlamaForCausalLM(nn.Module):
     def __init__(self, config: LlamaConfig):
         self.model = LlamaModel(config)
-        self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = Linear(
+            config.hidden_size, config.vocab_size, dtype=config.dtype, bias=False
+        )
 
         ############ Rotary embedding constants ############
         assert config.hidden_size % config.num_attention_heads == 0
         head_dim = config.hidden_size // config.num_attention_heads
-        self.cos_cached = nn.Parameter((config.max_sequence_length, head_dim), name="cos_cached")
-        self.sin_cached = nn.Parameter((config.max_sequence_length, head_dim), name="sin_cached")
+        self.cos_cached = nn.Parameter(
+            (config.max_sequence_length, head_dim),
+            dtype=config.dtype,
+            name="cos_cached",
+        )
+        self.sin_cached = nn.Parameter(
+            (config.max_sequence_length, head_dim),
+            dtype=config.dtype,
+            name="sin_cached",
+        )
         ############ End ############
 
     def forward(
@@ -473,7 +536,9 @@ class LlamaForCausalLM(nn.Module):
                 name="slice",
             )
 
-        logits = self.lm_head(nn.emit_te(te_slicing, hidden_states, primfunc_name_hint="slice"))
+        logits = self.lm_head(
+            nn.emit_te(te_slicing, hidden_states, primfunc_name_hint="slice")
+        )
 
         return logits, key_value_cache
 
@@ -485,7 +550,9 @@ def create_encoding_func(bb: relax.BlockBuilder, config: LlamaConfig) -> None:
     with bb.function("encoding"):
         model = LlamaForCausalLM(config)
         input_ids = nn.Placeholder((bsz, seq_len), dtype="int32", name="input_ids")
-        all_seq_len_shape = relax.Var("all_seq_len", relax.ShapeStructInfo((all_seq_len,)))
+        all_seq_len_shape = relax.Var(
+            "all_seq_len", relax.ShapeStructInfo((all_seq_len,))
+        )
         past_key_values = relax.Var(
             "kv_cache",
             relax.TupleStructInfo(
@@ -516,7 +583,9 @@ def create_decoding_func(bb: relax.BlockBuilder, config: LlamaConfig) -> None:
     with bb.function("decoding"):
         model = LlamaForCausalLM(config)
         input_ids = nn.Placeholder((bsz, 1), dtype="int32", name="input_ids")
-        all_seq_len_shape = relax.Var("all_seq_len", relax.ShapeStructInfo((all_seq_len,)))
+        all_seq_len_shape = relax.Var(
+            "all_seq_len", relax.ShapeStructInfo((all_seq_len,))
+        )
         past_key_values = relax.Var(
             "kv_cache",
             relax.TupleStructInfo(
@@ -542,11 +611,15 @@ def create_decoding_func(bb: relax.BlockBuilder, config: LlamaConfig) -> None:
 
 def create_kv_cache_func(bb: relax.BlockBuilder, config: LlamaConfig) -> None:
     init_shape = relax.ShapeExpr(
-        (1, config.num_attention_heads, config.hidden_size // config.num_attention_heads)
+        (
+            1,
+            config.num_attention_heads,
+            config.hidden_size // config.num_attention_heads,
+        )
     )
     with bb.function("create_kv_cache", []):
         with bb.dataflow():
-            zeros = bb.emit(relax.op.zeros(init_shape, "float32"))
+            zeros = bb.emit(relax.op.zeros(init_shape, config.dtype))
             caches = []
             f_kv_cache_create = relax.extern("vm.builtin.attention_kv_cache_create")
             for _ in range(config.num_hidden_layers * 2):
